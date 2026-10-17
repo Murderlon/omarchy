@@ -16,21 +16,8 @@ Panel {
   // manageIpc: false so this panel can own the single IpcHandler the target
   // permits — needed for the brightness + state methods below.
 
-  // Brightness is written optimistically: the slider moves first and
-  // `omarchy-brightness-display` verifies afterwards. brightnessPercent is both
-  // what the slider shows and the value the hardware still owes us,
-  // sentBrightnessPercent is what the write in flight is verifying, and
-  // confirmedBrightnessPercent is the last percentage the hardware accepted.
-  property int brightnessPercent: 0
-  property int sentBrightnessPercent: 0
-  property int confirmedBrightnessPercent: 0
-  property bool brightnessOsdPending: false
-  property bool brightnessWritePending: false
-  property bool brightnessWriteObsolete: false
-  property bool brightnessRequestPending: false
-  property int brightnessGeneration: 0
-  property int brightnessWriteToken: 0
-  property bool brightnessAvailable: false
+  readonly property int brightnessPercent: brightnessController.percent
+  readonly property bool brightnessAvailable: brightnessController.available
   property string internalMonitor: ""
   property string externalMonitor: ""
   property string focusedMonitor: ""
@@ -156,7 +143,7 @@ Panel {
   function adjustBrightness(delta) {
     if (focusSection !== "brightness") return
     if (!brightnessAvailable) return
-    setBrightness(root.brightnessPercent + delta)
+    brightnessController.request(root.brightnessPercent + delta)
   }
 
   function activateCursor() {
@@ -217,7 +204,7 @@ Panel {
 
   function brightnessIpc(percent) {
     var value = Number(percent)
-    root.setBrightness(value)
+    brightnessController.request(value)
     return "got " + root.brightnessPercent
   }
 
@@ -245,64 +232,9 @@ Panel {
 
   function refresh() {
     if (!stateProc.running) {
-      stateProc.brightnessGeneration = root.brightnessWritePending || brightnessDebounce.running
-        ? -1 : root.brightnessGeneration
+      stateProc.brightnessGeneration = brightnessController.readGeneration()
       stateProc.running = true
     }
-  }
-
-  function setBrightness(value) {
-    var percent = Model.clampBrightness(value)
-    root.brightnessPercent = percent
-    root.brightnessGeneration++
-    root.brightnessRequestPending = true
-
-    if (root.brightnessWritePending || setBrightnessProc.running) return
-
-    brightnessDebounce.stop()
-    root.brightnessWritePending = true
-    root.brightnessWriteObsolete = false
-    root.brightnessRequestPending = false
-    root.brightnessWriteToken++
-    root.sentBrightnessPercent = percent
-    setBrightnessProc.command = ["omarchy-brightness-display", "--no-osd", "--monitor", root.focusedMonitor, percent + "%"]
-    setBrightnessProc.running = true
-  }
-
-  function finishBrightnessWrite(exitCode, token) {
-    if (!root.brightnessWritePending || token !== root.brightnessWriteToken) return
-    root.brightnessWritePending = false
-    root.brightnessGeneration++
-    if (!root.brightnessWriteObsolete && exitCode === 0)
-      root.confirmedBrightnessPercent = root.sentBrightnessPercent
-
-    if (root.brightnessRequestPending
-        && (root.brightnessWriteObsolete || root.brightnessPercent !== root.sentBrightnessPercent)) {
-      // exited can run before Process clears running. Read the newest preview
-      // after it stops, including input that arrives before this callback.
-      Qt.callLater(function() {
-        if (token === root.brightnessWriteToken && !root.brightnessWritePending && root.brightnessRequestPending)
-          root.setBrightness(root.brightnessPercent)
-      })
-      return
-    }
-
-    root.brightnessRequestPending = false
-    if (root.brightnessWriteObsolete) return
-
-    // A reread here races the hardware and can hide the slider on an empty read.
-    if (exitCode !== 0) root.brightnessPercent = root.confirmedBrightnessPercent
-    if (root.brightnessOsdPending) {
-      root.brightnessOsdPending = false
-      if (exitCode === 0) root.showBrightnessOsd(root.brightnessPercent)
-    }
-  }
-
-  function previewBrightness(value) {
-    root.brightnessPercent = Model.clampBrightness(value)
-    root.brightnessGeneration++
-    root.brightnessRequestPending = true
-    brightnessDebounce.restart()
   }
 
   function showBrightnessOsd(percent) {
@@ -426,6 +358,7 @@ Panel {
     }
   }
 
+  onFocusedMonitorChanged: wheelAccumulator = 0
   onBrightnessAvailableChanged: clampCursor()
   onDisplaysChanged: clampCursor()
   onScaleValuesChanged: clampCursor()
@@ -451,22 +384,7 @@ Panel {
         var lines = String(text || "").split("\n")
         var brightness = String(lines[0] || "").trim()
         var monitor = String(lines[5] || "").trim()
-        var monitorChanged = monitor !== root.focusedMonitor
-        if (monitorChanged) {
-          root.brightnessWriteObsolete = true
-          root.brightnessRequestPending = false
-          root.brightnessOsdPending = false
-          root.confirmedBrightnessPercent = 0
-          root.wheelAccumulator = 0
-          brightnessDebounce.stop()
-        }
-        if (monitorChanged || (stateProc.brightnessGeneration === root.brightnessGeneration
-            && !root.brightnessWritePending && !brightnessDebounce.running)) {
-          root.brightnessAvailable = brightness !== "unavailable" && brightness !== ""
-          var read = root.brightnessAvailable ? Math.max(0, Math.min(100, parseInt(brightness, 10))) : 0
-          if (root.brightnessAvailable) root.confirmedBrightnessPercent = read
-          root.brightnessPercent = read
-        }
+        brightnessController.acceptRead(monitor, brightness, stateProc.brightnessGeneration)
         root.internalMonitor = String(lines[1] || "").trim()
         root.externalMonitor = String(lines[2] || "").trim()
         root.internalEnabled = String(lines[3] || "").trim() !== ""
@@ -478,27 +396,9 @@ Panel {
     }
   }
 
-  Timer {
-    id: brightnessDebounce
-    interval: 180
-    repeat: false
-    onTriggered: root.setBrightness(root.brightnessPercent)
-  }
-
-  Process {
-    id: setBrightnessProc
-    stdout: StdioCollector { waitForEnd: true }
-    onExited: function(exitCode, exitStatus) {
-      root.finishBrightnessWrite(exitStatus === 0 ? exitCode : 1, root.brightnessWriteToken)
-    }
-    onRunningChanged: {
-      if (running) return
-      // A failed start only changes running. Let a normal exit complete first.
-      var token = root.brightnessWriteToken
-      Qt.callLater(function() {
-        if (!setBrightnessProc.running) root.finishBrightnessWrite(1, token)
-      })
-    }
+  BrightnessController {
+    id: brightnessController
+    onVerified: function(percent) { root.showBrightnessOsd(percent) }
   }
 
   Process {
@@ -548,8 +448,7 @@ Panel {
       var wheel = Util.wheelSteps(root.wheelAccumulator, delta)
       root.wheelAccumulator = wheel.remainder
       if (wheel.steps === 0) return
-      root.brightnessOsdPending = true
-      root.setBrightness(root.brightnessPercent + wheel.steps * 5)
+      brightnessController.request(root.brightnessPercent + wheel.steps * 5, true)
     }
   }
 
@@ -711,20 +610,13 @@ Panel {
                 step: 1
                 value: root.brightnessPercent
                 integer: true
-                onMoved: function(v) { root.previewBrightness(v) }
-                onReleased: function(v) {
-                  brightnessDebounce.stop()
-                  root.setBrightness(v)
-                }
+                onMoved: function(v) { brightnessController.preview(v) }
+                onReleased: function(v) { brightnessController.request(v) }
 
                 Connections {
                   target: root
                   function onFocusedMonitorChanged() {
-                    if (!brightnessSlider.dragging) return
-                    brightnessSlider.enabled = false
-                    brightnessSlider.dragging = false
-                    brightnessSlider.liveValue = root.brightnessPercent
-                    Qt.callLater(function() { brightnessSlider.enabled = true })
+                    brightnessSlider.cancelDrag()
                   }
                 }
               }

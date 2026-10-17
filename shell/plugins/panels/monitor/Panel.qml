@@ -24,6 +24,9 @@ Panel {
   property int sentBrightnessPercent: 0
   property int confirmedBrightnessPercent: 0
   property bool brightnessOsdPending: false
+  property bool brightnessWritePending: false
+  property int brightnessGeneration: 0
+  property int brightnessWriteToken: 0
   property bool brightnessAvailable: false
   property string internalMonitor: ""
   property string externalMonitor: ""
@@ -237,26 +240,55 @@ Panel {
   }
 
   function refresh() {
-    if (!stateProc.running) stateProc.running = true
+    if (!stateProc.running) {
+      stateProc.brightnessGeneration = root.brightnessWritePending || brightnessDebounce.running
+        ? -1 : root.brightnessGeneration
+      stateProc.running = true
+    }
   }
 
   function setBrightness(value) {
     var percent = Model.clampBrightness(value)
     root.brightnessPercent = percent
+    root.brightnessGeneration++
 
-    // A write is already in flight. brightnessPercent now differs from the
-    // percentage that write is verifying, which is how onExited knows to send
-    // this one after it finishes -- so a drag coalesces into a single trailing
-    // write instead of one write per step.
-    if (setBrightnessProc.running) return
+    if (root.brightnessWritePending || setBrightnessProc.running) return
 
+    brightnessDebounce.stop()
+    root.brightnessWritePending = true
+    root.brightnessWriteToken++
     root.sentBrightnessPercent = percent
     setBrightnessProc.command = ["omarchy-brightness-display", "--no-osd", "--monitor", root.focusedMonitor, percent + "%"]
     setBrightnessProc.running = true
   }
 
+  function finishBrightnessWrite(exitCode, token) {
+    if (!root.brightnessWritePending || token !== root.brightnessWriteToken) return
+    root.brightnessWritePending = false
+    root.brightnessGeneration++
+    if (exitCode === 0) root.confirmedBrightnessPercent = root.sentBrightnessPercent
+
+    if (root.brightnessPercent !== root.sentBrightnessPercent) {
+      // exited can run before Process clears running. Read the newest preview
+      // after it stops, including input that arrives before this callback.
+      Qt.callLater(function() {
+        if (token === root.brightnessWriteToken && !root.brightnessWritePending)
+          root.setBrightness(root.brightnessPercent)
+      })
+      return
+    }
+
+    // A reread here races the hardware and can hide the slider on an empty read.
+    if (exitCode !== 0) root.brightnessPercent = root.confirmedBrightnessPercent
+    if (root.brightnessOsdPending) {
+      root.brightnessOsdPending = false
+      if (exitCode === 0) root.showBrightnessOsd(root.brightnessPercent)
+    }
+  }
+
   function previewBrightness(value) {
     root.brightnessPercent = Model.clampBrightness(value)
+    root.brightnessGeneration++
     brightnessDebounce.restart()
   }
 
@@ -392,19 +424,20 @@ Panel {
 
   Process {
     id: stateProc
+    property int brightnessGeneration: -1
     command: ["omarchy-monitor-state"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         var lines = String(text || "").split("\n")
         var brightness = String(lines[0] || "").trim()
-        root.brightnessAvailable = brightness !== "unavailable" && brightness !== ""
-        var read = root.brightnessAvailable ? Math.max(0, Math.min(100, parseInt(brightness, 10))) : 0
-        if (root.brightnessAvailable) root.confirmedBrightnessPercent = read
-        // A poll that lands mid-write read the hardware before the write got
-        // there, so it is already stale. brightnessPercent is the value we are
-        // still writing; let the write settle it rather than fighting the slider.
-        if (!setBrightnessProc.running) root.brightnessPercent = read
+        if (stateProc.brightnessGeneration === root.brightnessGeneration
+            && !root.brightnessWritePending && !brightnessDebounce.running) {
+          root.brightnessAvailable = brightness !== "unavailable" && brightness !== ""
+          var read = root.brightnessAvailable ? Math.max(0, Math.min(100, parseInt(brightness, 10))) : 0
+          if (root.brightnessAvailable) root.confirmedBrightnessPercent = read
+          root.brightnessPercent = read
+        }
         root.internalMonitor = String(lines[1] || "").trim()
         root.externalMonitor = String(lines[2] || "").trim()
         root.internalEnabled = String(lines[3] || "").trim() !== ""
@@ -426,39 +459,16 @@ Panel {
   Process {
     id: setBrightnessProc
     stdout: StdioCollector { waitForEnd: true }
-    // Do NOT call refresh() after a brightness set succeeds. The local
-    // brightnessPercent we just wrote is authoritative; re-reading via
-    // `omarchy-brightness-display` races the hardware/driver and can
-    // return an empty string, which the parser then coerces to 0 —
-    // visible as a "bounce to zero" after h/l keypresses. External
-    // brightness changes are still picked up by the 5s periodic refresh,
-    // the open-time refresh, and Component.onCompleted.
-    //
-    // A failed set is verified wrong, so snap the slider back to the last
-    // percentage the hardware confirmed. That revert is local
-    // for the same reason: refresh() here would race the read path and an empty
-    // result clears brightnessAvailable, which hides the slider until the next
-    // poll. The OSD is only shown once a write is verified.
-    onExited: function(exitCode) {
-      if (exitCode !== 0) {
-        root.brightnessOsdPending = false
-        root.brightnessPercent = root.confirmedBrightnessPercent
-        return
-      }
-
-      root.confirmedBrightnessPercent = root.sentBrightnessPercent
-
-      // The slider moved on while this write was in flight, so send what the
-      // hardware still owes us and let that write finish the burst.
-      if (root.brightnessPercent !== root.sentBrightnessPercent) {
-        root.setBrightness(root.brightnessPercent)
-        return
-      }
-
-      if (root.brightnessOsdPending) {
-        root.brightnessOsdPending = false
-        root.showBrightnessOsd(root.brightnessPercent)
-      }
+    onExited: function(exitCode, exitStatus) {
+      root.finishBrightnessWrite(exitStatus === 0 ? exitCode : 1, root.brightnessWriteToken)
+    }
+    onRunningChanged: {
+      if (running) return
+      // A failed start only changes running. Let a normal exit complete first.
+      var token = root.brightnessWriteToken
+      Qt.callLater(function() {
+        if (!setBrightnessProc.running) root.finishBrightnessWrite(1, token)
+      })
     }
   }
 

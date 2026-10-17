@@ -75,8 +75,8 @@ function panel() {
   for (const match of panelSource.matchAll(/^  property (?:int|bool|real|string) (\w+): (.+)$/gm)) {
     context[match[1]] = vm.runInContext(match[2], context)
   }
-  for (const match of panelSource.matchAll(/^  function (\w+)\(/gm)) {
-    vm.runInContext(functionSource(panelSource, match[1]), context)
+  for (const name of ['refresh', 'setBrightness', 'finishBrightnessWrite', 'previewBrightness', 'showBrightnessOsd', 'normalizeScale', 'updateDisplays']) {
+    vm.runInContext(functionSource(panelSource, name), context)
   }
   const exited = vm.runInContext(exitedSource, context)
   runningChanged = vm.runInContext(runningSource, context)

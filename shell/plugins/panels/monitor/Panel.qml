@@ -26,6 +26,8 @@ Panel {
   property int confirmedBrightnessPercent: 0
   property bool brightnessOsdPending: false
   property bool brightnessWritePending: false
+  property bool brightnessWriteObsolete: false
+  property bool brightnessRequestPending: false
   property int brightnessGeneration: 0
   property int brightnessWriteToken: 0
   property bool brightnessAvailable: false
@@ -253,11 +255,14 @@ Panel {
     var percent = Model.clampBrightness(value)
     root.brightnessPercent = percent
     root.brightnessGeneration++
+    root.brightnessRequestPending = true
 
     if (root.brightnessWritePending || setBrightnessProc.running) return
 
     brightnessDebounce.stop()
     root.brightnessWritePending = true
+    root.brightnessWriteObsolete = false
+    root.brightnessRequestPending = false
     root.brightnessWriteToken++
     root.sentBrightnessPercent = percent
     setBrightnessProc.command = ["omarchy-brightness-display", "--no-osd", "--monitor", root.focusedMonitor, percent + "%"]
@@ -268,17 +273,22 @@ Panel {
     if (!root.brightnessWritePending || token !== root.brightnessWriteToken) return
     root.brightnessWritePending = false
     root.brightnessGeneration++
-    if (exitCode === 0) root.confirmedBrightnessPercent = root.sentBrightnessPercent
+    if (!root.brightnessWriteObsolete && exitCode === 0)
+      root.confirmedBrightnessPercent = root.sentBrightnessPercent
 
-    if (root.brightnessPercent !== root.sentBrightnessPercent) {
+    if (root.brightnessRequestPending
+        && (root.brightnessWriteObsolete || root.brightnessPercent !== root.sentBrightnessPercent)) {
       // exited can run before Process clears running. Read the newest preview
       // after it stops, including input that arrives before this callback.
       Qt.callLater(function() {
-        if (token === root.brightnessWriteToken && !root.brightnessWritePending)
+        if (token === root.brightnessWriteToken && !root.brightnessWritePending && root.brightnessRequestPending)
           root.setBrightness(root.brightnessPercent)
       })
       return
     }
+
+    root.brightnessRequestPending = false
+    if (root.brightnessWriteObsolete) return
 
     // A reread here races the hardware and can hide the slider on an empty read.
     if (exitCode !== 0) root.brightnessPercent = root.confirmedBrightnessPercent
@@ -291,6 +301,7 @@ Panel {
   function previewBrightness(value) {
     root.brightnessPercent = Model.clampBrightness(value)
     root.brightnessGeneration++
+    root.brightnessRequestPending = true
     brightnessDebounce.restart()
   }
 
@@ -439,8 +450,18 @@ Panel {
       onStreamFinished: {
         var lines = String(text || "").split("\n")
         var brightness = String(lines[0] || "").trim()
-        if (stateProc.brightnessGeneration === root.brightnessGeneration
-            && !root.brightnessWritePending && !brightnessDebounce.running) {
+        var monitor = String(lines[5] || "").trim()
+        var monitorChanged = monitor !== root.focusedMonitor
+        if (monitorChanged) {
+          root.brightnessWriteObsolete = true
+          root.brightnessRequestPending = false
+          root.brightnessOsdPending = false
+          root.confirmedBrightnessPercent = 0
+          root.wheelAccumulator = 0
+          brightnessDebounce.stop()
+        }
+        if (monitorChanged || (stateProc.brightnessGeneration === root.brightnessGeneration
+            && !root.brightnessWritePending && !brightnessDebounce.running)) {
           root.brightnessAvailable = brightness !== "unavailable" && brightness !== ""
           var read = root.brightnessAvailable ? Math.max(0, Math.min(100, parseInt(brightness, 10))) : 0
           if (root.brightnessAvailable) root.confirmedBrightnessPercent = read
@@ -450,7 +471,7 @@ Panel {
         root.externalMonitor = String(lines[2] || "").trim()
         root.internalEnabled = String(lines[3] || "").trim() !== ""
         root.mirrorEnabled = String(lines[4] || "").trim() === root.externalMonitor && root.externalMonitor !== ""
-        root.focusedMonitor = String(lines[5] || "").trim()
+        root.focusedMonitor = monitor
         root.monitorScale = root.normalizeScale(String(lines[6] || "").trim())
         root.updateDisplays(String(lines[7] || "[]").trim())
       }
@@ -694,6 +715,17 @@ Panel {
                 onReleased: function(v) {
                   brightnessDebounce.stop()
                   root.setBrightness(v)
+                }
+
+                Connections {
+                  target: root
+                  function onFocusedMonitorChanged() {
+                    if (!brightnessSlider.dragging) return
+                    brightnessSlider.enabled = false
+                    brightnessSlider.dragging = false
+                    brightnessSlider.liveValue = root.brightnessPercent
+                    Qt.callLater(function() { brightnessSlider.enabled = true })
+                  }
                 }
               }
 
